@@ -3,8 +3,12 @@
 from src.data.atsyn_dataset import (
     ATSynDataset,
     IMG_EXTENSIONS,
+    VIDEO_EXTENSIONS,
     _list_image_files,
+    _list_video_files,
+    _load_all_video_frames,
     _load_rgb_tensor,
+    _load_video_clip_frames,
     collate_video_batch,
 )
 from src.data.real_datasets import RealTurbulenceVideoDataset
@@ -16,6 +20,10 @@ __all__ = [
     "Simplex3DTurbulenceAugmentor",
     "collate_video_batch",
     "IMG_EXTENSIONS",
+    "VIDEO_EXTENSIONS",
     "_list_image_files",
+    "_list_video_files",
     "_load_rgb_tensor",
+    "_load_video_clip_frames",
+    "_load_all_video_frames",
 ]

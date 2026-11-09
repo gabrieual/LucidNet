@@ -1,4 +1,4 @@
-"""Loader for ATSyn-Static and ATSyn-Dynamic Paired Benchmarks."""
+"""Loader for ATSyn-Static and ATSyn-Dynamic Paired Benchmarks (.mp4 videos & image folders)."""
 
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -11,18 +11,102 @@ from src.contracts.batch import VideoBatch
 from src.data.p2s_simulator import PhysicsTurbulenceSimulator
 
 IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 
 def _list_image_files(folder: Path) -> List[Path]:
-    if not folder.exists():
+    if not folder.exists() or not folder.is_dir():
         return []
     return sorted([p for p in folder.iterdir() if p.suffix.lower() in IMG_EXTENSIONS])
+
+
+def _list_video_files(folder: Path) -> List[Path]:
+    if not folder.exists() or not folder.is_dir():
+        return []
+    return sorted([p for p in folder.iterdir() if p.suffix.lower() in VIDEO_EXTENSIONS])
 
 
 def _load_rgb_tensor(path: Path) -> torch.Tensor:
     with Image.open(path) as img:
         rgb = img.convert("RGB")
         return TF.to_tensor(rgb)  # [3, H, W] float32 in [0, 1]
+
+
+def _get_video_frame_count(video_path: Path) -> int:
+    """Returns total number of frames in an .mp4 video file without decoding all frames."""
+    try:
+        import cv2  # type: ignore
+
+        cap = cv2.VideoCapture(str(video_path))
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        if count > 0:
+            return count
+    except ImportError:
+        pass
+
+    from torchvision.io import read_video
+
+    frames, _, _ = read_video(str(video_path), pts_unit="sec", output_format="TCHW")
+    return int(frames.shape[0])
+
+
+def _load_video_clip_frames(
+    video_path: Path,
+    start_frame: int,
+    num_frames: int,
+) -> torch.Tensor:
+    """
+    Decodes `num_frames` consecutive RGB frames starting at `start_frame` from an `.mp4` file.
+    Returns tensor of shape `[T, 3, H, W]` in `float32` `[0, 1]`.
+    Uses fast OpenCV seeking (`cv2.VideoCapture`) when available so only the requested
+    `num_frames` window is decoded; falls back to `torchvision.io.read_video`.
+    """
+    try:
+        import cv2  # type: ignore
+        import numpy as np
+
+        cap = cv2.VideoCapture(str(video_path))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total > 0 and start_frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        frames_list: List[torch.Tensor] = []
+        for _ in range(num_frames):
+            ret, frame_bgr = cap.read()
+            if not ret or frame_bgr is None:
+                break
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            tensor = torch.from_numpy( np.ascontiguousarray(frame_rgb) ).permute(2, 0, 1).float() / 255.0
+            frames_list.append(tensor)
+        cap.release()
+
+        if len(frames_list) > 0:
+            while len(frames_list) < num_frames:
+                frames_list.append(frames_list[-1].clone())
+            return torch.stack(frames_list[:num_frames], dim=0)
+    except ImportError:
+        pass
+
+    # Fallback to torchvision.io.read_video
+    from torchvision.io import read_video
+
+    vframes, _, _ = read_video(str(video_path), pts_unit="sec", output_format="TCHW")
+    total_v = vframes.shape[0]
+    if total_v == 0:
+        raise RuntimeError(f"Could not decode any frames from video: {video_path}")
+    indices = [(start_frame + i) % total_v for i in range(num_frames)]
+    selected = vframes[indices].float() / 255.0
+    return selected
+
+
+def _load_all_video_frames(
+    video_path: Path, max_frames: Optional[int] = None
+) -> torch.Tensor:
+    """Loads all frames (or up to `max_frames`) from an `.mp4` video file for inference."""
+    total = _get_video_frame_count(video_path)
+    n = min(total, max_frames) if (max_frames is not None and total > 0) else max(1, total)
+    return _load_video_clip_frames(video_path, start_frame=0, num_frames=n)
 
 
 def collate_video_batch(samples: List[VideoBatch]) -> VideoBatch:
@@ -49,14 +133,15 @@ def collate_video_batch(samples: List[VideoBatch]) -> VideoBatch:
 
 class ATSynDataset(Dataset):
     """
-    Paired atmospheric turbulence video dataset (ATSyn-static, ATSyn-dynamic, HeatChamber, TUG).
-    Expected directory layout:
-        root_dir/
-          degraded/<clip_id>/<frame_000.png>
-          gt/<clip_id>/<frame_000.png>
-          tilt_only/<clip_id>/<frame_000.png>  (optional intermediate tilt-only frames I_tilt)
-    If `root_dir` does not exist or is empty and `allow_synthetic_fallback=True`,
-    automatically falls back to procedural synthetic P2S generation so scripts run out-of-the-box.
+    Paired atmospheric turbulence video dataset supporting BOTH:
+      1. Direct `.mp4` video files inside `turb/`, `tilt/`, and `gt/` (official ATSyn layout):
+           train/ (or test/)
+             ├── turb/<clip_id>.mp4
+             ├── tilt/<clip_id>.mp4
+             └── gt/<clip_id>.mp4 (or .png/.jpg for static targets)
+      2. Frame directories inside `turb/<clip_id>/*.png`, `tilt/<clip_id>/*.png`, `gt/<clip_id>/*.png`.
+
+    Also automatically resolves `val` -> `test` when the dataset only has `train/` and `test/` splits.
     """
 
     def __init__(
@@ -69,7 +154,11 @@ class ATSynDataset(Dataset):
         fallback_length: int = 64,
     ) -> None:
         super().__init__()
-        self.root_dir = Path(root_dir)
+        raw_root = Path(root_dir)
+        # If `.../val` is requested but ATSyn only has `train` and `test`, automatically use `.../test`
+        if not raw_root.exists() and raw_root.name == "val" and (raw_root.parent / "test").exists():
+            raw_root = raw_root.parent / "test"
+        self.root_dir = raw_root
         self.num_frames = num_frames
         self.crop_size = crop_size
         self.is_train = is_train
@@ -77,24 +166,53 @@ class ATSynDataset(Dataset):
         self.fallback_length = fallback_length
 
         self.clips: List[Tuple[Path, Path, Optional[Path]]] = []
-        deg_root = self.root_dir / "degraded"
+        deg_root = (
+            (self.root_dir / "turb")
+            if (self.root_dir / "turb").exists()
+            else (self.root_dir / "degraded")
+        )
         gt_root = self.root_dir / "gt"
-        tilt_root = self.root_dir / "tilt_only"
+        tilt_root = (
+            (self.root_dir / "tilt")
+            if (self.root_dir / "tilt").exists()
+            else (self.root_dir / "tilt_only")
+        )
 
         if deg_root.exists() and gt_root.exists():
-            for clip_dir in sorted(deg_root.iterdir()):
-                if not clip_dir.is_dir():
+            for entry in sorted(deg_root.iterdir()):
+                # Case A: entry is a video file (e.g., `turb/0001.mp4`) or clip folder (`turb/0001/`)
+                is_valid_entry = entry.is_dir() or (
+                    entry.is_file() and entry.suffix.lower() in VIDEO_EXTENSIONS
+                )
+                if not is_valid_entry:
                     continue
-                gt_clip = gt_root / clip_dir.name
-                if gt_clip.exists():
-                    tilt_clip = (
-                        (tilt_root / clip_dir.name)
-                        if (tilt_root / clip_dir.name).exists()
+
+                stem = entry.stem if entry.is_file() else entry.name
+                gt_match = self._find_matching_entry(gt_root, entry.name, stem)
+                if gt_match is not None:
+                    tilt_match = (
+                        self._find_matching_entry(tilt_root, entry.name, stem)
+                        if tilt_root.exists()
                         else None
                     )
-                    self.clips.append((clip_dir, gt_clip, tilt_clip))
+                    self.clips.append((entry, gt_match, tilt_match))
 
         self.simulator = PhysicsTurbulenceSimulator()
+
+    @staticmethod
+    def _find_matching_entry(
+        parent_dir: Path, exact_name: str, stem: str
+    ) -> Optional[Path]:
+        """Finds a matching `.mp4` video, image file, or directory in `parent_dir`."""
+        if (parent_dir / exact_name).exists():
+            return parent_dir / exact_name
+        if (parent_dir / stem).exists():
+            return parent_dir / stem
+        for ext in list(VIDEO_EXTENSIONS) + list(IMG_EXTENSIONS):
+            candidate = parent_dir / f"{stem}{ext}"
+            if candidate.exists():
+                return candidate
+        return None
 
     def __len__(self) -> int:
         if len(self.clips) > 0:
@@ -127,6 +245,54 @@ class ATSynDataset(Dataset):
         ).clamp(0.0, 1.0)
         return base.unsqueeze(0).repeat(t, 1, 1, 1)  # [T, 3, H, W]
 
+    def _load_entry_sequence(
+        self,
+        entry_path: Path,
+        start_frame: int,
+        indices: List[int],
+    ) -> torch.Tensor:
+        """Loads `num_frames` from either a `.mp4` video file, a static image, or a folder of frames."""
+        if entry_path.is_file():
+            ext = entry_path.suffix.lower()
+            if ext in VIDEO_EXTENSIONS:
+                return _load_video_clip_frames(
+                    entry_path, start_frame=start_frame, num_frames=self.num_frames
+                )
+            if ext in IMG_EXTENSIONS:
+                single = _load_rgb_tensor(entry_path)
+                return single.unsqueeze(0).repeat(self.num_frames, 1, 1, 1)
+
+        # Directory case: check if it contains images or a nested .mp4 video
+        img_files = _list_image_files(entry_path)
+        if len(img_files) == 1:
+            single = _load_rgb_tensor(img_files[0])
+            return single.unsqueeze(0).repeat(self.num_frames, 1, 1, 1)
+        if len(img_files) > 1:
+            return torch.stack(
+                [_load_rgb_tensor(img_files[i % len(img_files)]) for i in indices],
+                dim=0,
+            )
+
+        vid_files = _list_video_files(entry_path)
+        if len(vid_files) > 0:
+            return _load_video_clip_frames(
+                vid_files[0], start_frame=start_frame, num_frames=self.num_frames
+            )
+        raise RuntimeError(f"No valid video or image frames found in {entry_path}")
+
+    def _get_entry_length(self, entry_path: Path) -> int:
+        if entry_path.is_file():
+            if entry_path.suffix.lower() in VIDEO_EXTENSIONS:
+                return _get_video_frame_count(entry_path)
+            return 1
+        img_files = _list_image_files(entry_path)
+        if len(img_files) > 0:
+            return len(img_files)
+        vid_files = _list_video_files(entry_path)
+        if len(vid_files) > 0:
+            return _get_video_frame_count(vid_files[0])
+        return 0
+
     def __getitem__(self, idx: int) -> VideoBatch:
         if len(self.clips) == 0:
             clean_clip = self._generate_procedural_clean_clip(idx)
@@ -138,12 +304,12 @@ class ATSynDataset(Dataset):
                 meta={"clip_name": f"synthetic_p2s_{idx:04d}", "d_r0": d_r0},
             )
 
-        deg_dir, gt_dir, tilt_dir = self.clips[idx]
-        deg_files = _list_image_files(deg_dir)
-        gt_files = _list_image_files(gt_dir)
-        tilt_files = _list_image_files(tilt_dir) if tilt_dir is not None else []
+        deg_entry, gt_entry, tilt_entry = self.clips[idx]
+        deg_len = self._get_entry_length(deg_entry)
+        gt_len = self._get_entry_length(gt_entry)
+        total = deg_len if gt_len == 1 else min(deg_len, gt_len)
+        total = max(1, total)
 
-        total = min(len(deg_files), len(gt_files))
         if total >= self.num_frames:
             start = (
                 int(torch.randint(0, total - self.num_frames + 1, (1,)).item())
@@ -152,13 +318,14 @@ class ATSynDataset(Dataset):
             )
             indices = list(range(start, start + self.num_frames))
         else:
+            start = 0
             indices = [i % total for i in range(self.num_frames)]
 
-        deg_seq = torch.stack([_load_rgb_tensor(deg_files[i]) for i in indices], dim=0)
-        gt_seq = torch.stack([_load_rgb_tensor(gt_files[i]) for i in indices], dim=0)
+        deg_seq = self._load_entry_sequence(deg_entry, start, indices)
+        gt_seq = self._load_entry_sequence(gt_entry, start, indices)
         tilt_seq = (
-            torch.stack([_load_rgb_tensor(tilt_files[i]) for i in indices], dim=0)
-            if len(tilt_files) >= total
+            self._load_entry_sequence(tilt_entry, start, indices)
+            if tilt_entry is not None
             else None
         )
 
@@ -183,9 +350,10 @@ class ATSynDataset(Dataset):
             if tilt_seq is not None:
                 tilt_seq = torch.flip(tilt_seq, dims=[-1])
 
+        clip_name = deg_entry.stem if deg_entry.is_file() else deg_entry.name
         return VideoBatch(
             degraded=deg_seq,
             gt=gt_seq,
             tilt_only=tilt_seq,
-            meta={"clip_name": deg_dir.name, "d_r0": 0.0},
+            meta={"clip_name": clip_name, "d_r0": 0.0},
         )

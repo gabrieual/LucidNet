@@ -2,7 +2,7 @@
 data:
   dataset_type: "atsyn"
   train_root: "datasets/ATSyn_dynamic/train"
-  val_root: "datasets/ATSyn_dynamic/val"
+  val_root: "datasets/ATSyn_dynamic/test"
   test_root: "datasets/ATSyn_dynamic/test"
   num_frames: 12
   crop_size: 256

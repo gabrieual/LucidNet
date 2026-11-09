@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Production Video Inference CLI Script supporting Sliding Window, Hann Tiling & Forensic Mode."""
+"""Production Video Inference CLI Script supporting .mp4 files & frame folders."""
 
 import argparse
 from pathlib import Path
@@ -12,7 +12,13 @@ if str(PROJECT_ROOT) not in sys.path:
 import torch
 from torchvision.utils import save_image
 
-from src.data.datasets import _list_image_files, _load_rgb_tensor
+from src.data.datasets import (
+    VIDEO_EXTENSIONS,
+    _list_image_files,
+    _list_video_files,
+    _load_all_video_frames,
+    _load_rgb_tensor,
+)
 from src.engine.inference import VideoInferenceEngine
 from src.models.cwd_net import build_cwd_net
 from src.utils.config_loader import load_config
@@ -20,7 +26,7 @@ from src.utils.config_loader import load_config
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run CWD-Net inference on a folder of frames (Full HD supported via Hann Overlap-Tile)."
+        description="Run CWD-Net inference on an .mp4 video or folder of frames (Full HD supported via Hann Overlap-Tile)."
     )
     parser.add_argument(
         "--config",
@@ -38,20 +44,20 @@ def parse_args() -> argparse.Namespace:
         "--input-dir",
         type=str,
         required=True,
-        help="Directory containing degraded video frames (.png/.jpg).",
+        help="Path to a degraded .mp4 video file OR directory containing .mp4/image frames.",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
         required=True,
-        help="Directory to write restored frames.",
+        help="Directory to write restored frames and .mp4 video.",
     )
     parser.add_argument(
         "--mode",
         type=str,
         choices=["video", "forensic_snapshot"],
         default="video",
-        help="'video' saves all restored frames; 'forensic_snapshot' saves single sharpest central frame.",
+        help="'video' saves all restored frames + .mp4; 'forensic_snapshot' saves single sharpest central frame.",
     )
     parser.add_argument(
         "--tile-size",
@@ -68,6 +74,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _save_mp4_if_possible(frames: torch.Tensor, mp4_path: Path, fps: float = 30.0) -> None:
+    """Writes [T, 3, H, W] float32 in [0, 1] to an .mp4 file using OpenCV when available."""
+    try:
+        import cv2  # type: ignore
+        import numpy as np
+
+        t, _, h, w = frames.shape
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(mp4_path), fourcc, fps, (w, h))
+        for idx in range(t):
+            rgb = (
+                (frames[idx].permute(1, 2, 0).clamp(0.0, 1.0).cpu().numpy() * 255.0)
+                .round()
+                .astype(np.uint8)
+            )
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            writer.write(bgr)
+        writer.release()
+        print(f"[Infer] Saved restored MP4 video to {mp4_path}")
+    except ImportError:
+        pass
+
+
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
@@ -81,20 +110,31 @@ def main() -> None:
         model.load_state_dict(state_dict)
         print(f"[Infer] Loaded EMA weights from {args.checkpoint}")
 
-    in_dir = Path(args.input_dir)
-    frame_paths = _list_image_files(in_dir)
-    if len(frame_paths) == 0:
-        raise RuntimeError(f"No image frames found in {in_dir}")
+    in_path = Path(args.input_dir)
+    if in_path.is_file() and in_path.suffix.lower() in VIDEO_EXTENSIONS:
+        video_tensor = _load_all_video_frames(in_path)
+    elif in_path.is_dir():
+        vid_files = _list_video_files(in_path)
+        if len(vid_files) > 0:
+            video_tensor = _load_all_video_frames(vid_files[0])
+        else:
+            frame_paths = _list_image_files(in_path)
+            if len(frame_paths) == 0:
+                raise RuntimeError(f"No .mp4 videos or image frames found in {in_path}")
+            video_tensor = torch.stack([_load_rgb_tensor(p) for p in frame_paths], dim=0)
+    else:
+        raise RuntimeError(f"Input path does not exist: {in_path}")
 
-    video_tensor = torch.stack([_load_rgb_tensor(p) for p in frame_paths], dim=0)  # [T, 3, H, W]
-    print(f"[Infer] Loaded {video_tensor.shape[0]} frames of shape {tuple(video_tensor.shape[1:])}")
+    print(
+        f"[Infer] Loaded {video_tensor.shape[0]} frames of shape {tuple(video_tensor.shape[1:])}"
+    )
 
     inf_cfg = cfg.get("inference", {})
     engine = VideoInferenceEngine(
         model=model,
         device=device,
-        window_size=int(inf_cfg.get("window_size", 12)),
-        temporal_stride=int(inf_cfg.get("temporal_stride", 6)),
+        window_size=int(inf_cfg.get("window_size", 24)),
+        temporal_stride=int(inf_cfg.get("temporal_stride", 16)),
         tile_size=args.tile_size,
         tile_overlap=args.tile_overlap,
         use_amp=True,
@@ -112,6 +152,7 @@ def main() -> None:
         for idx, frame in enumerate(restored):
             out_file = out_dir / f"frame_{idx:05d}.png"
             save_image(frame, str(out_file))
+        _save_mp4_if_possible(restored, out_dir / "restored.mp4")
         print(f"[Infer] Saved {restored.shape[0]} restored frames to {out_dir}")
 
 
