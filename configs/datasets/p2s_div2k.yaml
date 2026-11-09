@@ -1,0 +1,12 @@
+# Dataset Configuration: On-the-Fly Phase-to-Space (P2S) + 3D Simplex over DIV2K / Places
+data:
+  dataset_type: "p2s_div2k"
+  train_root: "datasets/DIV2K/train"
+  val_root: "datasets/DIV2K/val"
+  test_root: "datasets/DIV2K/test"
+  num_frames: 12
+  crop_size: 256
+  batch_size: 2
+  num_workers: 4
+  allow_synthetic_fallback: true
+  fallback_length: 64

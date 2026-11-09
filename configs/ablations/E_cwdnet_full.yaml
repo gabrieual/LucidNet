@@ -1,0 +1,34 @@
+# Ablation Variant E: Complete CWD-Net (CLEAR-Wiener-DATUM Network)
+# Full pipeline including Block 0 (FFT Stabilization + FRF + AOF + Complex Wavelet/FFT Prior P_t),
+# Block 1 (DAAB + GRUM + DIM), Block 2 (8x8 Windowed MTCSA), Block 3 (Multi-Channel Blind Wiener
+# Deconv in 2D-FFT with M=64 kernels), and Block 4 (Twin CAB Tilt + 4+6 NAFNet Decoder).
+_base_: "../default.yaml"
+
+experiment:
+  name: "E_cwdnet_full"
+
+model:
+  prior_extractor:
+    name: "classical_full"
+  alignment:
+    name: "daab_grum_dim"
+  fusion:
+    name: "mtcsa"
+  deconv:
+    name: "wiener_fft_multichannel"
+    kernel_size: 15
+    eps_min: 0.01
+    pad_size: 8
+  decoder:
+    name: "twin_naf_decoder"
+    num_blocks_s2: 4
+    num_blocks_s1: 6
+    max_tilt_displacement: 16.0
+
+loss:
+  lambda_char: 0.8
+  lambda_tilt: 0.2
+  lambda_fft: 0.05
+  lambda_tv: 0.01
+  lambda_cw_ssim: 0.1
+  lambda_lpips: 0.02

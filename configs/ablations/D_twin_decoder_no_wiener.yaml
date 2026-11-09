@@ -1,0 +1,25 @@
+# Ablation Variant D: Twin Decoder (Tilt Rectification of Skip Connections) Without Wiener Deconv
+# Evaluates the impact of Branch A (CAB stages) rectifying shallow skip connections (f1, f2)
+# via L_tilt (W(I_tilt, T_hat^{-1}) vs J_gt) and L_TV(T_hat^{-1}) before NAFNet decoding.
+_base_: "../default.yaml"
+
+experiment:
+  name: "D_twin_decoder_no_wiener"
+
+model:
+  prior_extractor:
+    name: "classical_full"
+  alignment:
+    name: "daab_grum_dim"
+  fusion:
+    name: "mtcsa"
+  deconv:
+    name: "identity_upsample"
+  decoder:
+    name: "twin_naf_decoder"
+    num_blocks_s2: 4
+    num_blocks_s1: 6
+
+loss:
+  lambda_tilt: 0.2
+  lambda_tv: 0.01

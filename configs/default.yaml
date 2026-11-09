@@ -1,0 +1,100 @@
+# Default Base Configuration for CWD-Net (CLEAR-Wiener-DATUM Network)
+# Matches all mathematical & architectural specifications in `arquitetura.md`.
+experiment:
+  name: "E_cwdnet_full"
+  seed: 42
+  deterministic: false
+  output_root: "experiments"
+  use_wandb: false
+  wandb_project: "cwd-net-turbulence"
+  wandb_entity: null
+  wandb_group: "cwdnet-ablations"
+  wandb_run_id: null
+
+data:
+  dataset_type: "atsyn"
+  train_root: "datasets/ATSyn_dynamic/train"
+  val_root: "datasets/ATSyn_dynamic/val"
+  test_root: "datasets/ATSyn_dynamic/test"
+  num_frames: 12
+  crop_size: 256
+  batch_size: 2
+  num_workers: 4
+  allow_synthetic_fallback: true
+  fallback_length: 64
+
+model:
+  dims:
+    c1: 64
+    c2: 96
+    c3: 128
+    deconv_channels: 64
+  prior_extractor:
+    name: "classical_full"
+    enable_stabilization: true
+    stabilize_in_train: false
+    use_frf: true
+    enable_motion_mask: true
+    frf_bandwidth: 0.05
+    frf_sigma: 0.5
+    frf_patch_size: 8
+    lambda_s: 0.02
+    outlier_weight: 1.0
+  encoder:
+    name: "shallow_multiscale"
+  alignment:
+    name: "daab_grum_dim"
+    num_groups: 8
+    num_samples: 4
+    max_offset: 6.0
+    num_rdbs: 4
+    growth_rate: 32
+    use_checkpoint: false
+  fusion:
+    name: "mtcsa"
+    window_size: 5
+    spatial_window: 8
+    num_heads: 4
+  deconv:
+    name: "wiener_fft_multichannel"
+    kernel_size: 15
+    eps_min: 0.01
+    pad_size: 8
+  decoder:
+    name: "twin_naf_decoder"
+    num_blocks_s2: 4
+    num_blocks_s1: 6
+    max_tilt_displacement: 16.0
+
+loss:
+  lambda_char: 0.8
+  lambda_tilt: 0.2
+  lambda_fft: 0.05
+  lambda_tv: 0.01
+  lambda_cw_ssim: 0.1
+  lambda_lpips: 0.02
+  phase2_start_ratio: 0.70
+  charbonnier_eps: 0.001
+  use_lpips: false
+
+train:
+  total_iters: 200000
+  warmup_iters: 2000
+  lr: 0.0002
+  min_lr: 0.000001
+  weight_decay: 0.0001
+  grad_clip_norm: 20.0
+  ema_decay: 0.999
+  use_amp: true
+  amp_dtype: "bfloat16"
+  log_interval: 50
+  val_interval: 2000
+  save_interval: 5000
+  keep_last_k_checkpoints: 3
+
+inference:
+  window_size: 24
+  temporal_stride: 16
+  tile_size: 512
+  tile_overlap: 64
+  mode: "video"

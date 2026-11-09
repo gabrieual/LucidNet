@@ -1,0 +1,25 @@
+# Ablation Variant B: Classical FRF Reference + AOF + Spectral Prior Only
+# Replaces naive temporal average with CDSP Frequency-Aware Reference Frame (FRF),
+# AOF motion mask, and 6-orientation complex wavelet * CLEAR similarity prior P_t.
+_base_: "../default.yaml"
+
+experiment:
+  name: "B_frf_only"
+
+model:
+  prior_extractor:
+    name: "classical_full"
+  alignment:
+    name: "optical_flow_only"
+  fusion:
+    name: "lucky_weighted_avg"
+  deconv:
+    name: "identity_upsample"
+  decoder:
+    name: "single_naf_decoder"
+    num_blocks_s2: 4
+    num_blocks_s1: 6
+
+loss:
+  lambda_tilt: 0.0
+  lambda_tv: 0.0

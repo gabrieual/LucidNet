@@ -1,0 +1,26 @@
+# Ablation Variant A: Baseline Sequential (proposta.pdf baseline equivalent)
+# Uses simple temporal mean reference, optical flow warping, scalar lucky average,
+# no Wiener deconvolution, and single-stage decoder (4+6 NAFBlocks).
+_base_: "../default.yaml"
+
+experiment:
+  name: "A_baseline_proposta"
+
+model:
+  prior_extractor:
+    name: "minimal_baseline"
+    frf_patch_size: 8
+  alignment:
+    name: "optical_flow_only"
+  fusion:
+    name: "lucky_weighted_avg"
+  deconv:
+    name: "identity_upsample"
+  decoder:
+    name: "single_naf_decoder"
+    num_blocks_s2: 4
+    num_blocks_s1: 6
+
+loss:
+  lambda_tilt: 0.0
+  lambda_tv: 0.0

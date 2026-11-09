@@ -1,0 +1,12 @@
+# Dataset Configuration: Real Atmospheric Turbulence Benchmarks (OTIS, BRIAR, RLR-AT, TurbText)
+data:
+  dataset_type: "real_eval"
+  train_root: "datasets/ATSyn_dynamic/train"
+  val_root: "datasets/OTIS"
+  test_root: "datasets/RLR_AT"
+  num_frames: 24
+  crop_size: 512
+  batch_size: 1
+  num_workers: 2
+  allow_synthetic_fallback: false
+  fallback_length: 0

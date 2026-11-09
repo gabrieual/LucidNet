@@ -1,0 +1,12 @@
+# Dataset Configuration: ATSyn-Dynamic & ATSyn-Static (DATUM CVPR 2024 Benchmark)
+data:
+  dataset_type: "atsyn"
+  train_root: "datasets/ATSyn_dynamic/train"
+  val_root: "datasets/ATSyn_dynamic/val"
+  test_root: "datasets/ATSyn_dynamic/test"
+  num_frames: 12
+  crop_size: 256
+  batch_size: 2
+  num_workers: 4
+  allow_synthetic_fallback: true
+  fallback_length: 64
