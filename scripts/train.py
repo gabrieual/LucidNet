@@ -145,15 +145,11 @@ def main() -> None:
         device=device,
     )
 
-    resume_path = args.resume
-    if resume_path is None and args.auto_resume:
-        candidate = exp_dir / "checkpoints" / "last.pt"
-        if candidate.exists():
-            resume_path = str(candidate)
-
-    if resume_path is not None:
-        print(f"[CWD-Net] Resuming from checkpoint: {resume_path}")
-        trainer.resume(resume_path)
+    if args.resume is not None:
+        print(f"[CWD-Net] Resuming from checkpoint: {args.resume}")
+        trainer.resume(args.resume)
+    elif args.auto_resume:
+        trainer.auto_resume()
 
     final_metrics = trainer.fit()
     print(f"[CWD-Net] Training finished. Final validation metrics: {final_metrics}")

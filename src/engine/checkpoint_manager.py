@@ -1,8 +1,9 @@
-"""Atomic Checkpoint Management with Exponential Moving Average (EMA) & Full RNG Recovery."""
+"""Atomic Checkpoint Management with EMA, Full RNG Recovery & Weights & Biases Cloud Sync."""
 
 import copy
 import os
 import random
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -15,7 +16,7 @@ class ModelEMA:
     Maintains an Exponential Moving Average (EMA) of model parameters:
         theta_ema <- decay * theta_ema + (1 - decay) * theta
     In optical restoration and blind deconvolution, evaluating with EMA weights
-    typically yields +0.25 to +0.40 dB PSNR and superior temporal stability.
+    typically yields +0.15 to +0.35 dB PSNR and superior temporal stability.
     """
 
     def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
@@ -43,17 +44,28 @@ class ModelEMA:
 
 class CheckpointManager:
     """
-    Manages atomic checkpoint saving and exact training state restoration
-    as specified in Section 7.1 of `arquitetura.md`:
+    Manages atomic checkpoint saving, exact training state restoration, and
+    automatic Weights & Biases (`wandb`) cloud synchronization:
       - Writes to `<filename>.tmp` and calls `os.replace()` (POSIX atomic rename)
         so power loss or SIGKILL never corrupts an existing checkpoint.
       - Tracks `last.pt`, `best_psnr.pt`, `best_cw_ssim.pt`, and rolling `step_{N}.pt`.
+      - When `wandb_run` is active:
+          1. Uploads `last.pt`, `best_psnr.pt`, and `best_cw_ssim.pt` to W&B run files
+             (`policy="now"`) so `wandb.restore()` can recover them from any machine.
+          2. Logs versioned W&B Model Artifacts (`type="model"`) with aliases
+             `["latest", "best_psnr", "best_cw_ssim"]`.
     """
 
-    def __init__(self, checkpoint_dir: str | Path, keep_last_k: int = 3) -> None:
+    def __init__(
+        self,
+        checkpoint_dir: str | Path,
+        keep_last_k: int = 3,
+        wandb_run: Optional[Any] = None,
+    ) -> None:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.keep_last_k = keep_last_k
+        self.wandb_run = wandb_run
         self.best_psnr: float = -float("inf")
         self.best_cw_ssim: float = -float("inf")
         self._rolling_History: List[Path] = []
@@ -63,6 +75,101 @@ class CheckpointManager:
         tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
         torch.save(payload, tmp_path)
         os.replace(tmp_path, target_path)
+
+    def _sync_to_wandb(
+        self,
+        files_to_sync: List[Path],
+        aliases: List[str],
+        global_step: int,
+        metrics: Dict[str, float],
+    ) -> None:
+        """Uploads checkpoint files and model artifacts to Weights & Biases."""
+        if self.wandb_run is None:
+            return
+        try:
+            import wandb  # type: ignore
+
+            base_dir = str(self.checkpoint_dir.parent)
+            for fpath in files_to_sync:
+                if fpath.exists():
+                    self.wandb_run.save(
+                        str(fpath),
+                        base_path=base_dir,
+                        policy="now",
+                    )
+
+            # Log versioned W&B Artifact whenever a new best checkpoint is achieved
+            best_Aliases = [a for a in aliases if a.startswith("best_")]
+            if best_Aliases:
+                art_name = f"cwdnet-{self.wandb_run.id}"
+                artifact = wandb.Artifact(
+                    name=art_name,
+                    type="model",
+                    metadata={
+                        "global_step": global_step,
+                        "best_psnr": self.best_psnr,
+                        "best_cw_ssim": self.best_cw_ssim,
+                        **metrics,
+                    },
+                )
+                for a in best_Aliases:
+                    pt_file = self.checkpoint_dir / f"{a}.pt"
+                    if pt_file.exists():
+                        artifact.add_file(str(pt_file), name=f"{a}.pt")
+                self.wandb_run.log_artifact(artifact, aliases=["latest"] + best_Aliases)
+        except Exception as exc:
+            print(f"[CheckpointManager] Warning: W&B checkpoint sync failed ({exc}).")
+
+    def try_restore_from_wandb(self, filename: str = "last.pt") -> Optional[Path]:
+        """
+        Attempts to download `checkpoints/<filename>` from the active W&B run
+        (or its latest model artifact) if it is not present on local disk.
+        """
+        target_path = self.checkpoint_dir / filename
+        if target_path.exists():
+            return target_path
+        if self.wandb_run is None:
+            return None
+
+        try:
+            import wandb  # type: ignore
+
+            rel_name = f"checkpoints/{filename}"
+            restored_file = wandb.restore(
+                rel_name,
+                run_path=self.wandb_run.path,
+                root=str(self.checkpoint_dir.parent),
+                replace=True,
+            )
+            if restored_file is not None and hasattr(restored_file, "name"):
+                restored_path = Path(restored_file.name)
+                restored_file.close()
+                if restored_path.exists():
+                    if restored_path.resolve() != target_path.resolve():
+                        shutil.copy2(restored_path, target_path)
+                    print(
+                        f"[CheckpointManager] Restored '{filename}' from W&B cloud ({target_path})"
+                    )
+                    return target_path
+        except Exception:
+            pass
+
+        # Fallback: try downloading from W&B Model Artifact
+        try:
+            art_name = f"cwdnet-{self.wandb_run.id}:latest"
+            artifact = self.wandb_run.use_artifact(art_name, type="model")
+            art_dir = Path(artifact.download())
+            candidate = art_dir / filename
+            if candidate.exists():
+                shutil.copy2(candidate, target_path)
+                print(
+                    f"[CheckpointManager] Restored '{filename}' from W&B Artifact '{art_name}'"
+                )
+                return target_path
+        except Exception:
+            pass
+
+        return None
 
     def save(
         self,
@@ -93,9 +200,13 @@ class CheckpointManager:
             "epoch": epoch,
             "global_step": global_step,
             "model_state_dict": raw_model.state_dict(),
-            "ema_state_dict": ema.state_dict() if ema is not None else raw_model.state_dict(),
+            "ema_state_dict": (
+                ema.state_dict() if ema is not None else raw_model.state_dict()
+            ),
             "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "scheduler_state_dict": (
+                scheduler.state_dict() if scheduler is not None else None
+            ),
             "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
             "best_metrics": {
                 "psnr": self.best_psnr,
@@ -107,21 +218,30 @@ class CheckpointManager:
                 "numpy": np.random.get_state(),
                 "torch": torch.get_rng_state(),
                 "cuda": (
-                    torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+                    torch.cuda.get_rng_state_all()
+                    if torch.cuda.is_available()
+                    else None
                 ),
             },
         }
 
-        # 1. Always update `last.pt` atomically
-        self._atomic_save(payload, self.checkpoint_dir / "last.pt")
+        last_path = self.checkpoint_dir / "last.pt"
+        self._atomic_save(payload, last_path)
+        files_to_sync = [last_path]
+        aliases = ["latest"]
 
-        # 2. Update best checkpoints when improved
         if is_best_psnr:
-            self._atomic_save(payload, self.checkpoint_dir / "best_psnr.pt")
-        if is_best_cw_ssim:
-            self._atomic_save(payload, self.checkpoint_dir / "best_cw_ssim.pt")
+            best_psnr_path = self.checkpoint_dir / "best_psnr.pt"
+            self._atomic_save(payload, best_psnr_path)
+            files_to_sync.append(best_psnr_path)
+            aliases.append("best_psnr")
 
-        # 3. Rolling step checkpoints (keep last K)
+        if is_best_cw_ssim:
+            best_cw_path = self.checkpoint_dir / "best_cw_ssim.pt"
+            self._atomic_save(payload, best_cw_path)
+            files_to_sync.append(best_cw_path)
+            aliases.append("best_cw_ssim")
+
         if is_periodic_step:
             step_path = self.checkpoint_dir / f"step_{global_step:07d}.pt"
             self._atomic_save(payload, step_path)
@@ -130,6 +250,14 @@ class CheckpointManager:
                 old = self._rolling_History.pop(0)
                 if old.exists():
                     old.unlink()
+
+        # Upload checkpoints to Weights & Biases cloud
+        self._sync_to_wandb(
+            files_to_sync=files_to_sync,
+            aliases=aliases,
+            global_step=global_step,
+            metrics=metrics,
+        )
 
     def load(
         self,

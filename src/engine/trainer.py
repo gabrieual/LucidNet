@@ -85,13 +85,9 @@ class Trainer:
             self.optimizer, lr_lambda=self._lr_lambda
         )
 
-        # EMA & Checkpointing (can point directly to Google Drive folder)
+        # EMA & Checkpointing (can point to local SSD, Google Drive, and W&B cloud)
         ema_decay = float(train_cfg.get("ema_decay", 0.999))
         self.ema = ModelEMA(self.model, decay=ema_decay)
-        self.ckpt_manager = CheckpointManager(
-            self.exp_dir / "checkpoints",
-            keep_last_k=int(train_cfg.get("keep_last_k_checkpoints", 3)),
-        )
 
         # Loss Function (2-Phase Curriculum)
         loss_cfg = dict(config.get("loss", {}))
@@ -137,6 +133,12 @@ class Trainer:
                 print(f"[Trainer] Warning: Could not initialize W&B ({exc}). Continuing without W&B.")
                 self.use_wandb = False
 
+        self.ckpt_manager = CheckpointManager(
+            self.exp_dir / "checkpoints",
+            keep_last_k=int(train_cfg.get("keep_last_k_checkpoints", 3)),
+            wandb_run=self.wandb_run,
+        )
+
     def _lr_lambda(self, step: int) -> float:
         if step < self.warmup_iters:
             return float(step + 1) / float(max(1, self.warmup_iters))
@@ -161,6 +163,27 @@ class Trainer:
         )
         self.start_epoch = int(ckpt.get("epoch", 0))
         self.global_step = int(ckpt.get("global_step", 0))
+
+    def auto_resume(self) -> bool:
+        """
+        Attempts to resume training from:
+          1. Local / Google Drive `<exp_dir>/checkpoints/last.pt`
+          2. Weights & Biases cloud (`wandb.restore('checkpoints/last.pt')`) if not on local disk.
+        Returns True if a checkpoint was found and loaded.
+        """
+        local_last = self.exp_dir / "checkpoints" / "last.pt"
+        if local_last.exists():
+            print(f"[Trainer] Auto-resuming from local/Drive checkpoint: {local_last}")
+            self.resume(local_last)
+            return True
+
+        wb_last = self.ckpt_manager.try_restore_from_wandb("last.pt")
+        if wb_last is not None and wb_last.exists():
+            print(f"[Trainer] Auto-resuming from W&B cloud checkpoint: {wb_last}")
+            self.resume(wb_last)
+            return True
+
+        return False
 
     def _append_csv(self, row: Dict[str, Any]) -> None:
         file_exists = self.csv_path.exists()
